@@ -1,9 +1,11 @@
-"""Shared helpers: RSA signatures, certificates, Diffie-Hellman, JSON files, and socket framing.
-Only Python's standard hashlib (SHA-256) and secrets (random numbers) are used."""
+"""Shared helpers: RSA signatures, certificates, Diffie-Hellman + HKDF, JSON files, socket framing.
+Only Python's standard hashlib (SHA-256), hmac, secrets (random numbers) and time are used."""
 import hashlib
+import hmac
 import json
 import secrets
 import struct
+import time
 
 # Diffie-Hellman group: the 2048-bit safe prime from RFC 3526 (group 14), generator 2.
 DH_PRIME = int(
@@ -20,6 +22,13 @@ DH_GENERATOR = 2
 
 def sha256(data):
     return hashlib.sha256(data).digest()
+
+
+# ------------------------------------------------------------------ HKDF (RFC 5869)
+def hkdf_sha256(secret, salt, info):
+    """Turn a raw secret into a 32-byte key. (Expand step needs only one block for 32 bytes.)"""
+    pseudo_random_key = hmac.new(salt, secret, hashlib.sha256).digest()              # extract
+    return hmac.new(pseudo_random_key, info + b"\x01", hashlib.sha256).digest()       # expand
 
 
 # ------------------------------------------------------------------ RSA
@@ -60,48 +69,86 @@ def generate_rsa_keypair(bits=2048, public_exponent=65537):
             return p * q, public_exponent, pow(public_exponent, -1, phi)
 
 
+# Fixed prefix that says "this is a SHA-256 hash" (part of the PKCS#1 v1.5 standard).
+SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def pkcs1_encode(message, n):
+    """PKCS#1 v1.5 signature padding: 00 01 FF..FF 00 || DigestInfo || SHA-256(message)."""
+    key_length = (n.bit_length() + 7) // 8
+    digest_info = SHA256_DIGEST_INFO + sha256(message)
+    padding = b"\xff" * (key_length - len(digest_info) - 3)
+    return int.from_bytes(b"\x00\x01" + padding + b"\x00" + digest_info, "big")
+
+
 def rsa_sign(message, n, private_exponent):
-    """signature = hash(message)^d mod n   (only the private key owner can compute this)."""
-    return pow(int.from_bytes(sha256(message), "big"), private_exponent, n)
+    """signature = padded_hash^d mod n   (only the private key owner can compute this)."""
+    return pow(pkcs1_encode(message, n), private_exponent, n)
 
 
 def rsa_verify(message, signature, n, public_exponent):
-    """Valid if signature^e mod n gives back hash(message)   (anyone can check this)."""
-    return pow(signature, public_exponent, n) == int.from_bytes(sha256(message), "big")
+    """Valid if signature^e mod n gives back the padded hash   (anyone can check this)."""
+    return 0 <= signature < n and pow(signature, public_exponent, n) == pkcs1_encode(message, n)
 
 
 # ------------------------------------------------------------------ certificates
+# A certificate = name + public key + usage + validity period, signed by an issuer (the CA).
 def certificate_bytes(certificate):
-    """The exact bytes the CA signs: owner name + public key."""
-    return f"{certificate['name']},{certificate['n']},{certificate['e']}".encode()
+    """The exact bytes the issuer signs (every field except the signature itself)."""
+    fields = {key: value for key, value in certificate.items() if key != "signature"}
+    return json.dumps(fields, sort_keys=True).encode()
 
 
-def create_certificate(owner_name, owner_n, owner_e, ca_n, ca_private_exponent):
-    """The CA signs (name, public key) -> binds the key to the name."""
-    certificate = {"name": owner_name, "n": owner_n, "e": owner_e}
-    certificate["signature"] = rsa_sign(certificate_bytes(certificate), ca_n, ca_private_exponent)
+def create_certificate(name, n, e, usage, issuer_name, issuer_n, issuer_private_exponent,
+                       valid_days=365):
+    now = int(time.time())
+    certificate = {"name": name, "n": n, "e": e, "usage": usage, "issuer": issuer_name,
+                   "not_before": now, "not_after": now + valid_days * 86400}
+    certificate["signature"] = rsa_sign(certificate_bytes(certificate), issuer_n,
+                                        issuer_private_exponent)
     return certificate
 
 
-def verify_certificate(certificate, ca_root):
-    """True only if this certificate was signed by the CA whose public key is `ca_root`."""
-    return rsa_verify(certificate_bytes(certificate), certificate["signature"],
-                      ca_root["n"], ca_root["e"])
+def check_certificate(certificate, issuer, expected_usage, expected_name=None):
+    """Raises ValueError (with the reason) unless the certificate is genuine and fit for use."""
+    if certificate["issuer"] != issuer["name"] or not rsa_verify(
+            certificate_bytes(certificate), certificate["signature"], issuer["n"], issuer["e"]):
+        raise ValueError("certificate NOT signed by the trusted CA")
+    if not certificate["not_before"] <= time.time() <= certificate["not_after"]:
+        raise ValueError("certificate expired or not yet valid")
+    if certificate["usage"] != expected_usage:
+        raise ValueError(f"certificate is not meant for '{expected_usage}'")
+    if expected_name is not None and certificate["name"] != expected_name:
+        raise ValueError(f"certificate name '{certificate['name']}' is not '{expected_name}'")
 
 
 # ------------------------------------------------------------------ Diffie-Hellman
+def handshake_transcript(server_name, client_dh_public, server_dh_public):
+    """Everything agreed in the handshake. The server signs it; both sides feed it into the key."""
+    return json.dumps({"protocol": "LEG-BANK-M3", "dh_group": "RFC3526-group14",
+                       "cipher": "AES-256-GCM", "server": server_name,
+                       "client_dh": client_dh_public, "server_dh": server_dh_public},
+                      sort_keys=True).encode()
+
+
 def dh_generate_keypair():
     """New random private value x and public value g^x mod p (call once per session)."""
     private_value = secrets.randbelow(DH_PRIME - 3) + 2
     return private_value, pow(DH_GENERATOR, private_value, DH_PRIME)
 
 
-def dh_derive_session_key(my_private_value, peer_public_value):
-    """shared secret = peer_public^my_private mod p, hashed into a 32-byte AES-256 key."""
+def dh_derive_session_key(my_private_value, peer_public_value, transcript):
+    """shared secret = peer_public^my_private mod p, then HKDF -> 32-byte AES-256 key."""
     if not 2 <= peer_public_value <= DH_PRIME - 2:      # reject trivial/invalid public values
         raise ValueError("invalid DH public value")
     shared_secret = pow(peer_public_value, my_private_value, DH_PRIME)
-    return sha256(str(shared_secret).encode())
+    return hkdf_sha256(shared_secret.to_bytes(256, "big"), salt=sha256(transcript),
+                       info=b"AES-256-GCM session key")
+
+
+def key_fingerprint(session_key):
+    """Short value to print on both sides to show they derived the same key (without leaking it)."""
+    return sha256(b"fingerprint" + session_key).hex()[:16].upper()
 
 
 # ------------------------------------------------------------------ files

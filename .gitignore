@@ -1,0 +1,10 @@
+# generated keys and certificates (private keys must not be committed)
+ca_root.json
+server_cert.json
+server_key.json
+client_key.json
+truststore.json
+
+# Python cache
+__pycache__/
+*.pyc
