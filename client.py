@@ -1,13 +1,15 @@
-"""Milestone 3 client.
+"""Milestone 3/4 client.
 1. Verifies the server via PKI (CA-signed certificate + signed handshake), then derives the AES key.
-2. Signs every transaction with its own RSA private key and sends it encrypted with AES-256-GCM."""
+2. Signs every transaction with its own RSA private key and sends it encrypted with AES-256-GCM.
+3. Key rotation: after MAX_MESSAGES_PER_KEY messages it runs a new signed DH handshake, so a
+   session key never lives for a whole long session."""
 import json
 import socket
 
 from aes_gcm import gcm_encrypt
-from pki import (check_certificate, dh_derive_session_key, dh_generate_keypair,
-                 handshake_transcript, key_fingerprint, load_json, receive_frame, rsa_sign,
-                 rsa_verify, send_frame)
+from pki import (MAX_MESSAGES_PER_KEY, TYPE_REKEY, check_certificate,
+                 dh_derive_session_key, dh_generate_keypair, handshake_transcript, key_fingerprint,
+                 load_json, receive_frame, rsa_sign, rsa_verify, send_frame)
 
 HOST, PORT = "127.0.0.1", 5050
 EXPECTED_SERVER_NAME = "leg-bank-server"            # who we think we are talking to
@@ -16,15 +18,17 @@ CA_ROOT = load_json("ca_root.json")                 # pre-trusted CA root certif
 CLIENT_PRIVATE_KEY = load_json("client_key.json")   # {"id", "n", "d"}  never leaves the client
 
 
-def do_handshake(connection):
+def do_handshake(connection, rekey=False):
     """Returns the 32-byte AES session key. Raises (and the session is never accepted) if the
-    server cannot be authenticated."""
+    server cannot be authenticated. rekey=True runs the same handshake again inside an existing
+    session = key rotation (new ephemeral DH values, so a completely new key)."""
     # The trusted root must itself be a valid, self-signed CA certificate.
     check_certificate(CA_ROOT, CA_ROOT, expected_usage="ca")
 
-    # New ephemeral DH pair for this session only.
+    # New ephemeral DH pair (every handshake, including every rotation).
     client_dh_private, client_dh_public = dh_generate_keypair()
-    send_frame(connection, json.dumps({"dh": client_dh_public}).encode())
+    hello = json.dumps({"dh": client_dh_public}).encode()
+    send_frame(connection, (TYPE_REKEY if rekey else b"") + hello)   # "R" tells the server: rotate
 
     reply = json.loads(receive_frame(connection))
     certificate, server_dh_public = reply["certificate"], reply["dh"]
@@ -45,6 +49,22 @@ def do_handshake(connection):
     return session_key
 
 
+def build_data_frame(session_key, sequence_number, message):
+    """Frame = nonce (12) | AES-GCM ciphertext | tag (16)."""
+    # 12-byte nonce = message counter: unique for every message under this key.
+    nonce = sequence_number.to_bytes(12, "big")
+
+    # Sign (nonce + message) with OUR private key: proves who sent it.
+    signature = rsa_sign(nonce + message.encode(),
+                         CLIENT_PRIVATE_KEY["n"], CLIENT_PRIVATE_KEY["d"])
+    transaction = json.dumps({"id": CLIENT_PRIVATE_KEY["id"],
+                              "message": message,
+                              "signature": signature}).encode()
+
+    # Encrypt with AES-256-GCM; the nonce is sent in front and is also authenticated.
+    return nonce + gcm_encrypt(session_key, nonce, transaction, associated_data=nonce)
+
+
 def main():
     with socket.create_connection((HOST, PORT)) as connection:
         try:
@@ -53,33 +73,32 @@ def main():
             raise SystemExit(f"[client] handshake failed, connection refused: {error}")
         print("[client] enter a message, or press Ctrl+C/Ctrl+D to exit")
 
-        sequence_number = 0               # increases with every message
+        sequence_number = 0               # messages sent under the CURRENT session key
         try:
             while True:
                 message = input("[client] message> ")
                 if not message:
                     continue
 
-                # 12-byte nonce = message counter: unique for every message under this key.
-                nonce = sequence_number.to_bytes(12, "big")
+                # Key lifetime reached: rotate to a brand-new session key before sending more.
+                if sequence_number >= MAX_MESSAGES_PER_KEY:
+                    print(f"[client] session key used for {MAX_MESSAGES_PER_KEY} messages - rotating key")
+                    old_fingerprint = key_fingerprint(session_key)
+                    session_key = do_handshake(connection, rekey=True)
+                    sequence_number = 0   # new key -> counter (and nonces) start again
+                    print(f"[client] KEY ROTATED: {old_fingerprint} -> {key_fingerprint(session_key)}")
 
-                # Sign (nonce + message) with OUR private key: proves who sent it.
-                signature = rsa_sign(nonce + message.encode(),
-                                     CLIENT_PRIVATE_KEY["n"], CLIENT_PRIVATE_KEY["d"])
-                transaction = json.dumps({"id": CLIENT_PRIVATE_KEY["id"],
-                                          "message": message,
-                                          "signature": signature}).encode()
-
-                # Encrypt with AES-256-GCM; the nonce is sent in front and is also authenticated.
-                frame = nonce + gcm_encrypt(session_key, nonce, transaction, associated_data=nonce)
+                frame = build_data_frame(session_key, sequence_number, message)
                 print(f"[client] plaintext  : {message}")
-                print(f"[client] ciphertext : {frame.hex().upper()} ({len(frame)} bytes)")
+                #print(f"[client] ciphertext : {frame.hex().upper()} ({len(frame)} bytes)")
                 send_frame(connection, frame)
                 sequence_number += 1
         except (EOFError, KeyboardInterrupt):
             print("\n[client] disconnected")
         except ConnectionError:
             print("\n[client] server closed the connection")
+        except (ValueError, KeyError) as error:
+            print(f"\n[client] key rotation failed, connection closed: {error}")
         finally:
             session_key = None            # drop the session key when the session ends
 

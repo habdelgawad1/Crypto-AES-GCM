@@ -151,6 +151,12 @@ def key_fingerprint(session_key):
     return sha256(b"fingerprint" + session_key).hex()[:16].upper()
 
 
+# ------------------------------------------------------------------ session policy
+MAX_MESSAGES_PER_KEY = 3    # rotate the session key after this many messages (use more in production)
+TYPE_REKEY = b"R"           # a frame starting with "R" begins a new DH handshake (key rotation).
+                            # Data frames start with their nonce, whose first byte is always 0x00.
+
+
 # ------------------------------------------------------------------ files
 def load_json(path):
     with open(path) as file:
